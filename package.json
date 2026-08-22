@@ -1,0 +1,10 @@
+{
+  "name": "voice-to-chess-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "web:build": "pnpm --filter @voice-to-chess/web build",
+    "web:check": "pnpm --filter @voice-to-chess/web check",
+    "web:dev": "pnpm --filter @voice-to-chess/web dev"
+  }
+}
