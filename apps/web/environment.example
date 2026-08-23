@@ -9,6 +9,43 @@ IP_HASH_SECRET=
 UPSTASH_REDIS_REST_URL=
 UPSTASH_REDIS_REST_TOKEN=
 
+# Server-only Move Interpreter policy. Keep hosted authoritative unless the
+# offline, shadow, preflight, and staging gates have all passed.
+VOICE_INTERPRETER_POLICY_VERSION=hosted-v1
+VOICE_INTERPRETER_AUTHORITY=hosted
+VOICE_INTERPRETER_TIMEOUT_MS=12000
+VOICE_INTERPRETER_SHADOW_AUTHORITY=none
+VOICE_INTERPRETER_SHADOW_TIMEOUT_MS=3000
+VOICE_INTERPRETER_SHADOW_MAX_CONCURRENCY=2
+VOICE_HOSTED_INTERPRETER_RELEASE_ID=gpt-4o-mini
+VOICE_HOSTED_INTERPRETER_PROMPT_ID=move-intent-v2-hosted-v3
+
+# Safe, non-secret placement identities required by release preflight. Set the
+# actual provider region names for the deployed Vercel gateway and Redis.
+VOICE_GATEWAY_REGION=
+VOICE_REDIS_REGION=
+
+# Required only when the server policy selects or shadows the private SLM.
+# Never use PUBLIC_ names for either value.
+SLM_INTERPRETER_URL=
+SLM_INTERPRETER_TOKEN=
+SLM_INTERPRETER_RELEASE_ID=
+SLM_INTERPRETER_RELEASE_IDENTITY_SHA256=
+# Required whenever the policy selects or shadows the SLM. These are safe
+# deployment identities, not URLs or credentials.
+SLM_INTERPRETER_REGION=
+SLM_INTERPRETER_GPU_CLASS=
+SLM_INTERPRETER_MIN_WARM_REPLICAS=1
+
+# Server-only bearer token for reviewing or deleting explicitly consented
+# shadow evidence through the operator endpoint.
+SHADOW_EVIDENCE_OPERATOR_TOKEN=
+
+# Separate server-only bearer for the release-preflight receipt at
+# /api/operator/release-preflight. Use a different randomly generated value
+# in each staging and production environment.
+RELEASE_PREFLIGHT_OPERATOR_TOKEN=
+
 # Optional server quota overrides
 VOICE_MOVES_PER_MINUTE=20
 VOICE_MOVES_PER_DAY=250

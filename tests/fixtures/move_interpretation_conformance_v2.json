@@ -1,0 +1,20 @@
+{
+  "schema": "move-interpretation-conformance/v1",
+  "cases": [
+    { "name": "ordinary move", "compact": "M|N|f3|-|-|-|-|-|-", "canonical": "M|N|f3|-|-|-|-|-|-" },
+    { "name": "source square", "compact": "M|B|c4|g2|-|-|-|-|-", "canonical": "M|B|c4|g2|-|-|-|-|-" },
+    { "name": "source file capture", "compact": "M|N|d5|-|b|-|x|-|-", "canonical": "M|N|d5|-|b|-|x|-|-" },
+    { "name": "source rank", "compact": "M|R|e1|-|-|1|-|-|-", "canonical": "M|R|e1|-|-|1|-|-|-" },
+    { "name": "pawn capture", "compact": "M|P|d5|-|-|-|x|-|-", "canonical": "M|P|d5|-|-|-|x|-|-" },
+    { "name": "promotion", "compact": "M|P|e8|-|-|-|-|N|-", "canonical": "M|P|e8|-|-|-|-|N|-" },
+    { "name": "en passant", "compact": "M|P|d6|e5|-|-|x|-|ep", "canonical": "M|P|d6|e5|-|-|x|-|ep" },
+    { "name": "king-side castle", "compact": "O-O", "canonical": "O-O" },
+    { "name": "queen-side castle", "compact": "O-O-O", "canonical": "O-O-O" },
+    { "name": "recapture", "compact": "R|N|d5|-|b|-|-|-|-", "canonical": "R|N|d5|-|b|-|-|-|-" },
+    { "name": "unknown", "compact": "UNKNOWN", "canonical": "UNKNOWN" },
+    { "name": "leading whitespace", "compact": " M|P|e4|-|-|-|-|-|-", "invalid": true },
+    { "name": "prose", "compact": "I think M|P|e4|-|-|-|-|-|-", "invalid": true },
+    { "name": "multiple source constraints", "compact": "M|N|d5|b4|b|-|-|-|-", "invalid": true },
+    { "name": "invalid en passant piece", "compact": "M|N|d6|e5|-|-|x|-|ep", "invalid": true }
+  ]
+}

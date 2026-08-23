@@ -5,6 +5,7 @@ import type { Cookies } from '@sveltejs/kit';
 
 const COOKIE_NAME = 'vtc_access';
 const PASS_SECONDS = 7 * 24 * 60 * 60;
+const DEVELOPMENT_COOKIE_SECRET = 'blindfold-chess-local-cookie-secret';
 
 export type AccessPass = {
 	sessionId: string;
@@ -64,7 +65,7 @@ export function readAccessPass(cookies: Cookies): AccessPass | undefined {
 }
 
 function signature(payload: string): string {
-	const secret = env.ACCESS_COOKIE_SECRET;
+	const secret = env.ACCESS_COOKIE_SECRET ?? (dev ? DEVELOPMENT_COOKIE_SECRET : undefined);
 	if (!secret || secret.length < 32) {
 		throw new Error('ACCESS_COOKIE_SECRET must contain at least 32 characters.');
 	}

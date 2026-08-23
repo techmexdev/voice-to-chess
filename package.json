@@ -3,8 +3,8 @@
   "private": true,
   "packageManager": "pnpm@11.9.0",
   "scripts": {
-    "web:build": "pnpm --filter @voice-to-chess/web build",
-    "web:check": "pnpm --filter @voice-to-chess/web check",
-    "web:dev": "pnpm --filter @voice-to-chess/web dev"
+    "web:build": "pnpm --filter @blindfold-chess/web build",
+    "web:check": "pnpm --filter @blindfold-chess/web check",
+    "web:dev": "pnpm --filter @blindfold-chess/web dev"
   }
 }

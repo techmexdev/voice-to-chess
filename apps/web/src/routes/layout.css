@@ -90,9 +90,6 @@
 	--accent-text: #12100e;
 	--danger: #ef7e6d;
 	--danger-border: #8e3d32;
-	--board-hidden-dark: #1a1712;
-	--board-hidden-light: #211d17;
-	--board-hidden-text: #4a4136;
 	--page-glow: rgb(201 162 39 / 8%);
 	--noise-opacity: 0.2;
 	--board-shadow: rgb(0 0 0 / 30%);
@@ -135,9 +132,6 @@ html[data-theme='light'] {
 	--accent-text: #17120d;
 	--danger: #a13b32;
 	--danger-border: #bc746d;
-	--board-hidden-dark: #c8b89f;
-	--board-hidden-light: #e8dccb;
-	--board-hidden-text: #8b7a64;
 	--page-glow: rgb(184 138 13 / 10%);
 	--noise-opacity: 0.11;
 	--board-shadow: rgb(76 57 35 / 20%);

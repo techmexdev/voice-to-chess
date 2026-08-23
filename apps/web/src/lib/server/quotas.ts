@@ -1,4 +1,6 @@
+import { dev } from '$app/environment';
 import { env } from '$env/dynamic/private';
+import { LocalVoiceQuotas, shouldUseLocalVoiceQuotas } from '$lib/server/localVoiceQuotas';
 import { redisCommand } from '$lib/server/redis';
 
 const VOICE_RESERVATION_SCRIPT = `
@@ -72,12 +74,24 @@ return {1, 'ok'}
 
 type QuotaResult = { allowed: boolean; reason: string; remainingGames: number };
 
+const localVoiceQuotas = new LocalVoiceQuotas(numberFromEnv('VOICE_GAMES_PER_DAY', 3));
+
+function useLocalVoiceQuotas(): boolean {
+	return shouldUseLocalVoiceQuotas({
+		development: dev,
+		redisUrl: env.UPSTASH_REDIS_REST_URL ?? env.KV_REST_API_URL,
+		redisToken: env.UPSTASH_REDIS_REST_TOKEN ?? env.KV_REST_API_TOKEN
+	});
+}
+
 export async function reserveVoiceMove(input: {
 	sessionId: string;
 	ipHash: string;
 	gameId: string;
 	requestId: string;
 }): Promise<QuotaResult> {
+	if (useLocalVoiceQuotas()) return localVoiceQuotas.reserveVoiceMove(input);
+
 	const now = new Date();
 	const day = now.toISOString().slice(0, 10);
 	const month = day.slice(0, 7);
@@ -109,6 +123,8 @@ export async function reserveVoiceMove(input: {
 }
 
 export async function releaseVoiceLock(sessionId: string, requestId: string): Promise<void> {
+	if (useLocalVoiceQuotas()) return localVoiceQuotas.releaseVoiceLock(sessionId, requestId);
+
 	await redisCommand([
 		'EVAL',
 		"if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0",
@@ -119,6 +135,8 @@ export async function releaseVoiceLock(sessionId: string, requestId: string): Pr
 }
 
 export async function finishVoiceGame(sessionId: string, gameId: string): Promise<{ remainingGames: number; voiceMoves: number }> {
+	if (useLocalVoiceQuotas()) return localVoiceQuotas.finishVoiceGame(sessionId, gameId);
+
 	const now = Math.floor(Date.now() / 1000);
 	const result = await redisCommand<[number, number]>([
 		'EVAL', END_GAME_SCRIPT, 3,
@@ -135,6 +153,8 @@ export async function finishVoiceGame(sessionId: string, gameId: string): Promis
 }
 
 export async function remainingVoiceGames(sessionId: string): Promise<number> {
+	if (useLocalVoiceQuotas()) return localVoiceQuotas.remainingVoiceGames(sessionId);
+
 	const now = Math.floor(Date.now() / 1000);
 	const used = Number(await redisCommand<number | string>([
 		'EVAL',
@@ -147,6 +167,8 @@ export async function remainingVoiceGames(sessionId: string): Promise<number> {
 }
 
 export async function reserveTts(sessionId: string): Promise<{ allowed: boolean; reason: string }> {
+	if (useLocalVoiceQuotas()) return localVoiceQuotas.reserveTts(sessionId);
+
 	const day = new Date().toISOString().slice(0, 10);
 	const month = day.slice(0, 7);
 	const result = await redisCommand<[number, string]>([

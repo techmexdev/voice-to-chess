@@ -1,3 +1,4 @@
+import { dev } from '$app/environment';
 import { env } from '$env/dynamic/private';
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
@@ -10,7 +11,7 @@ const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/sit
 
 export const GET: RequestHandler = async ({ cookies }) => {
 	try {
-		const pass = readAccessPass(cookies);
+		const pass = readAccessPass(cookies) ?? (dev ? issueAccessPass(cookies) : undefined);
 		if (!pass) return json({ access: false, remainingGames: 3 });
 		return json({ access: true, remainingGames: await remainingVoiceGames(pass.sessionId) });
 	} catch (error) {

@@ -11,6 +11,8 @@
 		type PromotionPiece
 	} from '$lib/game/GameSession';
 	import { moveAnnouncement } from '$lib/game/moveAnnouncement';
+	import { applyVoiceTurnOutcome, loadVoiceTurnResponse } from '$lib/game/VoiceTurn';
+	import type { VoiceResolverContext } from '$lib/game/VoiceResolverContext';
 	import type { BoardColor, BoardMoveRequest, BoardSeatView } from '$lib/board/types';
 
 	type BlindSide = 'none' | 'white' | 'black' | 'both';
@@ -26,16 +28,13 @@
 	type AudioContextConstructor = new () => AudioContext;
 	type SpokenMoveApiResponse = {
 		transcript?: unknown;
-		interpretation?: {
-			status?: unknown;
-			san?: unknown;
-		};
+		outcome?: unknown;
 		error?: unknown;
 		remainingGames?: unknown;
 	};
 	type SpeechRequest =
-		| { cacheKey: string; text: string; body: { kind: 'move'; san: string } }
-		| { cacheKey: string; text: string; body: { kind: 'feedback'; code: 'ambiguous' | 'illegal' | 'failed' } };
+		| { cacheKey: string; text: string; body: { kind: 'move'; color: BoardColor; san: string } }
+		| { cacheKey: string; text: string; body: { kind: 'feedback'; code: 'unknown' | 'ambiguous' | 'illegal' | 'failed' } };
 	type TurnstileApi = {
 		render: (container: HTMLElement, options: Record<string, unknown>) => string;
 		reset: (widgetId?: string) => void;
@@ -61,8 +60,15 @@
 			webkitAudioContext?: AudioContextConstructor;
 		};
 
-	const files = 'abcdefgh';
 	const speechCorrectionSeconds = 5;
+	const moveInterpreterSystemPrompt = `Transcript -> exactly one line:
+UNKNOWN
+O-O
+O-O-O
+M|piece|destination|source-square|source-file|source-rank|capture|promotion|special
+R|piece|destination|source-square|source-file|source-rank|-|promotion|-
+
+piece=P/N/B/R/Q/K; square=a1-h8; source-file=a-h; source-rank=1-8; capture=x; promotion=Q/R/B/N; special=ep; unspoken=-. M=move; R=spoken recapture. UNKNOWN if not one coherent move. Preserve only spoken constraints. Never infer legality/SAN/check/mate. No explanation.`;
 	const clockPresets: readonly ClockPreset[] = [
 		{ id: '3+2', label: '3 + 2', initialMs: 3 * 60_000, incrementMs: 2_000 },
 		{ id: '5+3', label: '5 + 3', initialMs: 5 * 60_000, incrementMs: 3_000 },
@@ -76,16 +82,6 @@
 		b: 'Bishop',
 		n: 'Knight'
 	};
-	const boardSquares = Array.from({ length: 64 }, (_, index) => {
-		const rankIndex = Math.floor(index / 8);
-		const fileIndex = index % 8;
-
-		return {
-			coordinate: files[fileIndex] + String(8 - rankIndex),
-			dark: (rankIndex + fileIndex) % 2 === 1
-		};
-	});
-
 	const optionBase =
 		'flex-1 rounded-[3px] border px-2 py-2.5 text-[13px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-hover)]';
 	const optionActive = 'border-[var(--border-active)] bg-[var(--surface-active)] text-[var(--text-strong)]';
@@ -96,6 +92,7 @@
 	let theme = $state<Theme>('dark');
 	let gameStarted = $state(false);
 	let blindSide = $state<BlindSide>('white');
+	let hideBoardForBlindfoldedPlayers = $state(false);
 	let clockPresetId = $state<ClockPresetId>('10+5');
 	let gameSession = new GameSession();
 	let gameSnapshot = $state<GameSnapshot>(gameSession.snapshot());
@@ -111,6 +108,8 @@
 	let typedMove = $state('');
 	let transcript = $state('');
 	let parseHint = $state('');
+	let heardTranscript = $state('');
+	let spokenCaption = $state('');
 	let lastMoveSan = $state('');
 	let pendingPromotion = $state<PendingPromotion | undefined>();
 	let speechCorrection = $state<SpeechCorrection | undefined>();
@@ -125,8 +124,10 @@
 	let mediaRecorder: MediaRecorder | undefined;
 	let mediaStream: MediaStream | undefined;
 	let audioChunks: Blob[] = [];
-	let recordingFen = '';
+	let recordingVoiceResolverContext: VoiceResolverContext | undefined;
 	let recordingCorrectionId: number | undefined;
+	let recordingDiagnosticConsent = false;
+	let retainShadowEvidence = $state(false);
 	let voiceRequestSequence = 0;
 	let correctionIdSequence = 0;
 	let accessReady = $state(false);
@@ -138,23 +139,19 @@
 	let gameId = '';
 	let gameFinalized = false;
 	let remainingVoiceGames = $state(3);
-	let handoffConfirmed = $state(true);
 
 	let selectedClock = $derived(
 		clockPresets.find((preset) => preset.id === clockPresetId) ?? clockPresets[2]
 	);
 	let clockEnabled = $derived(selectedClock.id !== 'none');
 	let inputColor = $derived(speechCorrection?.move.color ?? gameSnapshot.turn);
-	let boardIsMasked = $derived(
-		gameStarted && !setupOpen && (isBlindfolded(inputColor) || !handoffConfirmed)
-	);
 	let blindfoldTurn = $derived(
 		gameStarted && !setupOpen && isBlindfolded(inputColor)
 	);
+	let boardPositionHidden = $derived(blindfoldTurn && hideBoardForBlindfoldedPlayers);
 	let gameCanAcceptInput = $derived(
 		gameStarted &&
 			!setupOpen &&
-			handoffConfirmed &&
 			timeExpired === null &&
 			(speechCorrection !== undefined || gameSnapshot.status === 'active')
 	);
@@ -167,7 +164,7 @@
 			(gameSnapshot.status !== 'active' || timeExpired !== null)
 	);
 	let positionDetailsVisible = $derived(
-		gameStarted && !setupOpen && handoffConfirmed && !isBlindfolded(inputColor)
+		gameStarted && !setupOpen && !isBlindfolded(inputColor)
 	);
 	let turnLabel = $derived(
 		setupOpen
@@ -193,7 +190,7 @@
 		lastMove: gameSnapshot.lastMove,
 		check: gameSnapshot.check,
 		legalDestinations: gameSnapshot.legalDestinations,
-		inputEnabled: boardCanAcceptMoves && !boardIsMasked && !blindfoldTurn
+		inputEnabled: boardCanAcceptMoves && !blindfoldTurn
 	} satisfies BoardSeatView);
 	let whiteClockActive = $derived(
 		clockCanRun && clockEnabled && inputColor === 'white'
@@ -359,6 +356,7 @@
 
 	function resetLocalGame() {
 		cancelMoveAnnouncements();
+		hideBoardForBlindfoldedPlayers = false;
 		gameSession = new GameSession();
 		gameSnapshot = gameSession.snapshot();
 		whiteTimeMs = selectedClock.initialMs;
@@ -368,8 +366,8 @@
 		pendingPromotion = undefined;
 		speechCorrection = undefined;
 		lastMoveSan = '';
-		handoffConfirmed = blindSide === 'none';
 		gameFinalized = false;
+		retainShadowEvidence = false;
 		gameId = crypto.randomUUID();
 	}
 
@@ -385,6 +383,8 @@
 		typedMove = '';
 		transcript = '';
 		parseHint = '';
+		heardTranscript = '';
+		spokenCaption = '';
 		if (accessReady) {
 			void fetch('/api/events', {
 				method: 'POST',
@@ -404,12 +404,9 @@
 		typedMove = '';
 		transcript = '';
 		parseHint = '';
+		heardTranscript = '';
+		spokenCaption = '';
 		pendingPromotion = undefined;
-	}
-
-	function confirmHandoff() {
-		handoffConfirmed = true;
-		clockLastTickAt = performance.now();
 	}
 
 	async function finishGameQuota() {
@@ -431,7 +428,7 @@
 	function correctionHint() {
 		if (!speechCorrection) return '';
 
-		return `Say or type a replacement, undo, or keep ${speechCorrection.move.san}. ${speechCorrection.secondsRemaining} seconds remaining.`;
+		return `Undo on the board, type a replacement, or keep ${speechCorrection.move.san}. ${speechCorrection.secondsRemaining} seconds remaining.`;
 	}
 
 	function keepSpeechMove(expired = false) {
@@ -446,7 +443,6 @@
 			? `Correction time ended. Kept ${move.san}.`
 			: `Kept ${move.san}.`;
 		parseHint = positionHint(gameSnapshot);
-		handoffConfirmed = blindSide === 'none' || gameSnapshot.status !== 'active';
 		if (gameSnapshot.status !== 'active') void finishGameQuota();
 	}
 
@@ -456,7 +452,6 @@
 		timeExpired = expired;
 		transcript = `${playerName(expired)} ran out of time.`;
 		parseHint = `${playerName(opponentOf(expired))} wins on time.`;
-		handoffConfirmed = true;
 		void finishGameQuota();
 	}
 
@@ -508,20 +503,30 @@
 
 	function queueMoveAnnouncement(move: GameMove) {
 		const text = moveAnnouncement(move);
-		queueSpeech({ cacheKey: `move:${move.san}`, text, body: { kind: 'move', san: move.san } }, 'Move announcement');
+		queueSpeech(
+			{
+				cacheKey: `move:${move.color}:${move.san}`,
+				text,
+				body: { kind: 'move', color: move.color, san: move.san }
+			},
+			'Move announcement'
+		);
 	}
 
-	function queueSpokenFeedback(code: 'ambiguous' | 'illegal' | 'failed') {
-		const text = code === 'ambiguous'
-			? 'Ambiguous move. Say the complete move again.'
-			: code === 'illegal'
-				? 'Illegal move. Say the complete move again.'
-				: 'Voice input failed. Please try again.';
+	function queueSpokenFeedback(code: 'unknown' | 'ambiguous' | 'illegal' | 'failed') {
+		const text = code === 'unknown'
+			? 'I did not understand that move. Say the complete move again.'
+			: code === 'ambiguous'
+				? 'Ambiguous move. Say the complete move again.'
+				: code === 'illegal'
+					? 'Illegal move. Say the complete move again.'
+					: 'Voice input failed. Please try again.';
 		queueSpeech({ cacheKey: `feedback:${code}`, text, body: { kind: 'feedback', code } }, 'Spoken feedback');
 	}
 
 	function queueSpeech(speech: SpeechRequest, errorLabel: string) {
 		const generation = speechGeneration;
+		spokenCaption = speech.text;
 		announcementPending = true;
 
 		const queued = speechQueue
@@ -616,6 +621,7 @@
 	async function beginListening(source: PressSource) {
 		if (
 			!gameCanAcceptInput ||
+			speechCorrection ||
 			activePress ||
 			requestingMicrophone ||
 			processingVoice
@@ -628,8 +634,9 @@
 		releaseAnimation = false;
 		activePress = source;
 		requestingMicrophone = true;
-		transcript = 'Requesting microphone access…';
-		parseHint = 'Allow microphone access, then hold the control while you speak.';
+		heardTranscript = '';
+		transcript = '';
+		parseHint = '';
 
 		try {
 			if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
@@ -648,12 +655,15 @@
 				audioBitsPerSecond: 64_000
 			});
 			let recordingFailed = false;
+			const resolverContext = gameSession.createVoiceResolverContext();
 
 			mediaStream = stream;
 			mediaRecorder = recorder;
 			audioChunks = [];
-			recordingFen = speechCorrection?.fenBefore ?? gameSnapshot.fen;
-			recordingCorrectionId = speechCorrection?.id;
+			recordingVoiceResolverContext = resolverContext;
+			recordingCorrectionId = undefined;
+			recordingDiagnosticConsent = retainShadowEvidence;
+			retainShadowEvidence = false;
 			recorder.ondataavailable = (event) => {
 				if (event.data.size > 0) audioChunks.push(event.data);
 			};
@@ -663,11 +673,14 @@
 			recorder.onstop = () => {
 				const chunks = audioChunks;
 				const recordedType = recorder.mimeType || mimeType || 'audio/webm';
-				const fen = recordingFen;
+				const resolverContext = recordingVoiceResolverContext;
 				const correctionId = recordingCorrectionId;
+				const diagnosticConsent = recordingDiagnosticConsent;
 
 				audioChunks = [];
+				recordingVoiceResolverContext = undefined;
 				recordingCorrectionId = undefined;
+				recordingDiagnosticConsent = false;
 				mediaRecorder = undefined;
 				stopMediaStream(stream);
 				mediaStream = undefined;
@@ -676,14 +689,21 @@
 					voiceFailure('The recording failed. Please try again.');
 					return;
 				}
+				if (resolverContext === undefined) {
+					voiceFailure('The voice request could not be prepared. Please try again.');
+					return;
+				}
 
-				void submitSpokenMove(new Blob(chunks, { type: recordedType }), fen, correctionId);
+				void submitSpokenMove(
+					new Blob(chunks, { type: recordedType }),
+					resolverContext,
+					correctionId,
+					diagnosticConsent
+				);
 			};
 			recorder.start();
 			requestingMicrophone = false;
 			listening = true;
-			transcript = 'Listening…';
-			parseHint = 'Release when you finish the complete move.';
 			playFeedbackSound('press');
 			recordingTimer = window.setTimeout(() => stopListening(), 15_000);
 		} catch (error) {
@@ -700,22 +720,27 @@
 		if (requestingMicrophone) {
 			requestingMicrophone = false;
 			transcript = 'Microphone request canceled.';
-			parseHint = 'Hold the control again when you are ready.';
+			parseHint = '';
 			return;
 		}
 		if (!listening || !mediaRecorder || mediaRecorder.state !== 'recording') return;
 
 		listening = false;
 		processingVoice = true;
-		transcript = 'Processing your move…';
-		parseHint = 'Transcribing speech, then checking it against the legal moves.';
+		transcript = '';
+		parseHint = '';
 		clearRecordingTimer();
 		mediaRecorder.stop();
 		triggerReleaseAnimation();
 		playFeedbackSound('release');
 	}
 
-	async function submitSpokenMove(audio: Blob, fen: string, correctionId?: number) {
+	async function submitSpokenMove(
+		audio: Blob,
+		resolverContext: VoiceResolverContext,
+		correctionId?: number,
+		diagnosticConsent = false
+	) {
 		if (audio.size === 0) {
 			voiceFailure('No speech was recorded. Please try again.');
 			return;
@@ -725,16 +750,18 @@
 		const requestSequence = ++voiceRequestSequence;
 		const extension = audioExtension(audio.type);
 		body.set('audio', new File([audio], `spoken-move.${extension}`, { type: audio.type }));
-		body.set('fen', fen);
+		body.set('resolverContext', JSON.stringify(resolverContext));
 		body.set('gameId', gameId);
 		body.set('requestId', crypto.randomUUID());
+		if (diagnosticConsent) body.set('diagnosticConsent', 'per-turn-shadow-evidence/v1');
 
 		try {
 			const response = await fetch('/api/spoken-move', { method: 'POST', body });
 			const payload = (await response.json()) as SpokenMoveApiResponse;
 			if (requestSequence !== voiceRequestSequence) return;
 
-			if (!response.ok) {
+			const voiceTurn = loadVoiceTurnResponse(payload);
+			if (!response.ok && voiceTurn.outcome.kind !== 'failure') {
 				throw new Error(
 					typeof payload.error === 'string'
 						? payload.error
@@ -742,50 +769,55 @@
 				);
 			}
 			if (typeof payload.remainingGames === 'number') remainingVoiceGames = payload.remainingGames;
-			const correctionRequest = correctionId !== undefined;
-			if (
-				correctionRequest
-					? !speechCorrection || speechCorrection.id !== correctionId
-					: gameSnapshot.fen !== fen
-			) {
-				throw new Error('The position changed while the move was processing. Please say it again.');
-			}
-			if (
-				typeof payload.transcript !== 'string' ||
-				!payload.interpretation ||
-				typeof payload.interpretation.status !== 'string'
-			) {
-				throw new Error('The speech service returned an invalid response.');
-			}
-
-			const heard = `Heard “${payload.transcript}”`;
-			if (
-				payload.interpretation.status === 'ok' &&
-				typeof payload.interpretation.san === 'string'
-			) {
-				if (!syncActiveClock()) return;
-				const result = correctionRequest
-					? gameSession.replaceLastNotation(payload.interpretation.san)
-					: gameSession.attemptNotation(payload.interpretation.san);
-				applyMoveResult(result, 'voice', fen);
-				if (result.kind === 'accepted') parseHint = `${heard}. ${correctionHint()}`;
+			const correctionRequest = resolverContext.correction !== null;
+			if (correctionRequest && (!speechCorrection || speechCorrection.id !== correctionId)) {
+				voiceFailure('The correction window ended before the replacement was ready.', true);
 				return;
 			}
 
-			if (payload.interpretation.status === 'ambiguous' && payload.interpretation.san === null) {
-				transcript = 'That could mean more than one legal move. Say the complete move again.';
-				parseHint = `${heard}.${speechCorrection ? ` ${correctionHint()}` : ''}`;
-				queueSpokenFeedback('ambiguous');
-				return;
+			heardTranscript = voiceTurn.transcript ?? '';
+			switch (voiceTurn.outcome.kind) {
+				case 'resolved': {
+					if (!syncActiveClock()) return;
+					const result = applyVoiceTurnOutcome(gameSession, resolverContext, voiceTurn.outcome);
+					if (result.kind === 'accepted') {
+						applyMoveResult(result, 'voice', resolverContext.resolverFen);
+						parseHint = correctionHint();
+						return;
+					}
+					if (result.kind === 'stale') {
+						voiceFailure('The position changed while the move was processing. Please say it again.', correctionRequest);
+						return;
+					}
+					if (result.kind === 'illegal') {
+						voiceIllegal();
+						return;
+					}
+					voiceFailure('The voice response could not be applied. Please try again.', correctionRequest);
+					return;
+				}
+				case 'ambiguous':
+					transcript = 'That could mean more than one legal move. Say the complete move again.';
+					parseHint = voiceRepeatHint();
+					queueSpokenFeedback('ambiguous');
+					return;
+				case 'illegal':
+					voiceIllegal();
+					return;
+				case 'unknown':
+					transcript = 'I could not understand a complete move. Say it again.';
+					parseHint = voiceRepeatHint();
+					queueSpokenFeedback('unknown');
+					return;
+				case 'failure':
+					voiceFailure(
+						typeof payload.error === 'string'
+							? payload.error
+							: 'The spoken move could not be processed. Please try again.',
+						correctionRequest
+					);
+					return;
 			}
-			if (payload.interpretation.status === 'invalid' && payload.interpretation.san === null) {
-				transcript = 'That does not match a legal move. Say the complete move again.';
-				parseHint = `${heard}.${speechCorrection ? ` ${correctionHint()}` : ''}`;
-				queueSpokenFeedback('illegal');
-				return;
-			}
-
-			throw new Error('The speech service returned an invalid move result.');
 		} catch (error) {
 			if (requestSequence !== voiceRequestSequence) return;
 			voiceFailure(error instanceof Error ? error.message : 'The spoken move could not be processed.');
@@ -794,13 +826,25 @@
 		}
 	}
 
-	function voiceFailure(message: string) {
+	function voiceIllegal() {
+		transcript = 'That does not match a legal move. Say the complete move again.';
+		parseHint = voiceRepeatHint();
+		queueSpokenFeedback('illegal');
+	}
+
+	function voiceRepeatHint() {
+		return speechCorrection ? correctionHint() : '';
+	}
+
+	function voiceFailure(message: string, preservesCorrection = speechCorrection !== undefined) {
 		listening = false;
 		processingVoice = false;
 		requestingMicrophone = false;
 		activePress = null;
 		transcript = message;
-		parseHint = speechCorrection ? `The original move remains. ${correctionHint()}` : 'No move was played.';
+		parseHint = preservesCorrection
+			? `The original move remains.${speechCorrection ? ` ${correctionHint()}` : ''}`
+			: 'No move was played.';
 		queueSpokenFeedback('failed');
 		clearRecordingTimer();
 	}
@@ -819,7 +863,9 @@
 		}
 		mediaRecorder = undefined;
 		audioChunks = [];
+		recordingVoiceResolverContext = undefined;
 		recordingCorrectionId = undefined;
+		recordingDiagnosticConsent = false;
 		if (mediaStream) stopMediaStream(mediaStream);
 		mediaStream = undefined;
 	}
@@ -957,6 +1003,7 @@
 				event.code !== 'Space' ||
 				event.repeat ||
 				setupOpen ||
+				speechCorrection ||
 				isTextEntryTarget(event.target)
 			) {
 				return;
@@ -1082,7 +1129,6 @@
 				parseHint = `${
 					source === 'typed' ? 'Typed move accepted. ' : 'Board move accepted. '
 				}${positionHint(result.snapshot)}`;
-				handoffConfirmed = blindSide === 'none' || result.snapshot.status !== 'active';
 			}
 			queueMoveAnnouncement(result.move);
 			if (result.snapshot.status !== 'active' && !speechCorrection) void finishGameQuota();
@@ -1162,7 +1208,7 @@
 </script>
 
 <svelte:head>
-	<title>Voice to Chess | Play chess blindfolded with your friends</title>
+	<title>Blindfold Chess | Play chess blindfolded with your friends</title>
 	<meta name="theme-color" content={theme === 'dark' ? '#100e0c' : '#f1eadf'} />
 </svelte:head>
 
@@ -1179,7 +1225,7 @@
 					class="size-12 rounded-[14px] shadow-sm transition-transform group-hover:-translate-y-px group-focus-visible:-translate-y-px"
 				/>
 				<span class="flex flex-col">
-					<span class="whitespace-nowrap font-display text-[23px] leading-none tracking-[0.01em]">Voice to Chess</span>
+					<span class="whitespace-nowrap font-display text-[23px] leading-none tracking-[0.01em]">Blindfold Chess</span>
 					<span class="mt-0.5 hidden text-[10px] text-[var(--text-faint)] sm:block">Play chess blindfolded</span>
 				</span>
 			</a>
@@ -1231,9 +1277,9 @@
 								class="size-2.5 rounded-full bg-[var(--text)]"
 								aria-hidden="true"
 							></span>
-						<p class="text-[15px] tracking-[0.01em]">
-							{positionDetailsVisible ? turnLabel : `${playerName(inputColor)} to move · blindfolded`}
-						</p>
+							<p class="text-[15px] tracking-[0.01em]">
+								{positionDetailsVisible ? turnLabel : `${playerName(inputColor)} to move · blindfolded`}
+							</p>
 						</div>
 					</div>
 					{/if}
@@ -1267,38 +1313,93 @@
 						</p>
 					</div>
 
+					{#if blindfoldTurn}
+						<button
+							type="button"
+							class="flex w-full items-center justify-between gap-4 rounded-[4px] border px-4 py-3 text-left shadow-sm transition-[background-color,border-color,color,transform] hover:-translate-y-px focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-hover)] motion-reduce:transform-none"
+							class:border-[var(--accent)]={boardPositionHidden}
+							class:bg-[var(--surface-active)]={boardPositionHidden}
+							class:text-[var(--text)]={boardPositionHidden}
+							class:border-[var(--accent-hover)]={!boardPositionHidden}
+							class:bg-[var(--accent)]={!boardPositionHidden}
+							class:text-[var(--accent-text)]={!boardPositionHidden}
+							aria-pressed={hideBoardForBlindfoldedPlayers}
+							onclick={() => (hideBoardForBlindfoldedPlayers = !hideBoardForBlindfoldedPlayers)}
+						>
+							<span class="flex items-center gap-3">
+								<span class="grid size-9 shrink-0 place-items-center rounded-full bg-[var(--accent-text)]/10" aria-hidden="true">
+									<svg viewBox="0 0 24 24" class="size-5" fill="none" stroke="currentColor" stroke-width="1.8">
+										<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"></path>
+										<circle cx="12" cy="12" r="2.5"></circle>
+										{#if !boardPositionHidden}<path d="m4 4 16 16"></path>{/if}
+									</svg>
+								</span>
+								<span class="flex flex-col">
+									<span class="text-[14px] font-semibold">{boardPositionHidden ? 'Show board' : 'Hide board'}</span>
+									<span class="mt-0.5 text-[11px] opacity-75">
+										{boardPositionHidden ? 'Reveal the current position' : 'Play this turn without seeing the pieces'}
+									</span>
+								</span>
+							</span>
+							<span class="text-[12px] font-medium opacity-70">Blindfold</span>
+						</button>
+					{/if}
+
 					<div class="shadow-board-frame relative aspect-square w-full overflow-hidden rounded border border-[var(--border)]">
-						{#if boardIsMasked}
-							<div class="grid size-full grid-cols-8">
-								{#each boardSquares as square}
+						<div class="size-full">
+							{#key boardPositionHidden}
+								<ChessgroundBoard view={boardView} onMove={captureBoardMove} positionHidden={boardPositionHidden} />
+							{/key}
+						</div>
+						{#if speechCorrection}
+							<div class="absolute inset-0 z-20 grid place-items-center bg-[rgba(16,14,12,.68)] p-5 backdrop-blur-[2px] sm:p-8">
+								<div
+									class="shadow-panel w-full max-w-[360px] overflow-hidden rounded-[6px] border border-[var(--accent)] bg-[var(--surface)] text-[var(--text)]"
+									role="dialog"
+									aria-labelledby="undo-title"
+									aria-describedby="undo-description"
+								>
 									<div
-										class:!bg-[var(--board-hidden-dark)]={square.dark}
-										class:bg-[var(--surface-raised)]={square.dark === false}
-										class="relative grid place-items-center"
+										class="h-1 bg-[var(--border-medium)]"
+										role="progressbar"
+										aria-label="Time left to undo"
+										aria-valuemin="0"
+										aria-valuemax={speechCorrectionSeconds}
+										aria-valuenow={speechCorrection.secondsRemaining}
 									>
-										<span class="font-mono text-[11px] tracking-[0.04em] text-[var(--board-hidden-text)]">
-											{square.coordinate}
-										</span>
+										<div
+											class="h-full bg-[var(--accent)] transition-[width] duration-1000 ease-linear motion-reduce:transition-none"
+											style={`width: ${(speechCorrection.secondsRemaining / speechCorrectionSeconds) * 100}%`}
+										></div>
 									</div>
-								{/each}
-							</div>
-						{:else}
-							<div class="size-full">
-								<ChessgroundBoard view={boardView} onMove={captureBoardMove} />
-							</div>
-						{/if}
-						{#if gameStarted && !setupOpen && !handoffConfirmed}
-							<div class="absolute inset-0 grid place-items-center bg-[rgba(16,14,12,.78)] p-6 backdrop-blur-[3px]">
-								<div class="max-w-64 text-center">
-									<p class="font-display text-[26px] text-[var(--text-strong)]">Pass the device</p>
-									<p class="mt-2 text-[13px] leading-5 text-[var(--text-muted)]">
-										{playerName(inputColor)} is next. The position stays hidden until they are ready.
-									</p>
-									<button
-										type="button"
-										class="shadow-primary mt-5 rounded-[3px] bg-[var(--accent)] px-4 py-2.5 text-[13px] font-semibold text-[var(--accent-text)]"
-										onclick={confirmHandoff}>Ready for {playerName(inputColor)}</button
-									>
+									<div class="p-5 sm:p-6">
+										<div class="flex items-start justify-between gap-4">
+											<div>
+												<p class="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--accent)]">Move accepted</p>
+												<h2 id="undo-title" class="mt-1.5 font-display text-[27px] leading-none">Undo {speechCorrection.move.san}?</h2>
+											</div>
+											<div class="shrink-0 rounded-[4px] bg-[var(--accent)] px-2.5 py-1.5 font-mono text-[18px] font-semibold leading-none text-[var(--accent-text)] tabular-nums">
+												{speechCorrection.secondsRemaining}s
+											</div>
+										</div>
+										<p id="undo-description" class="mt-4 text-[14px] leading-5 text-[var(--text-muted)]">
+											{moveAnnouncement(speechCorrection.move)} The move stays unless you undo it.
+										</p>
+										<div class="mt-5 grid grid-cols-2 gap-2.5">
+											<button
+												type="button"
+												class="rounded-[4px] bg-[var(--accent)] px-4 py-3 text-[14px] font-semibold text-[var(--accent-text)] transition-colors hover:bg-[var(--accent-hover)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-hover)]"
+												onclick={undoLastMove}
+											>Undo move</button
+											>
+											<button
+												type="button"
+												class="rounded-[4px] border border-[var(--border-strong)] bg-[var(--surface-raised)] px-4 py-3 text-[14px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--surface-hover)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-hover)]"
+												onclick={() => keepSpeechMove()}
+											>Keep move</button
+											>
+										</div>
+									</div>
 								</div>
 							</div>
 						{/if}
@@ -1386,24 +1487,7 @@
 									</button>
 								{/each}
 							</div>
-							<p class="text-[11px] text-[var(--text-faint)]">
-								Minutes plus increment in seconds
-							</p>
 						</fieldset>
-
-						<div class="border-t border-[var(--border-faint)] pt-4">
-							<p class="text-[12px] font-medium text-[var(--text-muted)]">Voice access</p>
-							<p class="mt-1 text-[11px] leading-5 text-[var(--text-faint)]">{accessMessage}</p>
-							{#if !accessReady}
-								<div class="mt-3 min-h-[65px]" bind:this={turnstileContainer}></div>
-							{/if}
-							<p class="mt-2 text-[10px] leading-4 text-[var(--text-faint)]">
-								Audio is sent to OpenAI only after you release the button. It is not stored by this app.
-							</p>
-							<p class="mt-2 text-[10px] leading-4 text-[var(--text-faint)]">
-								Voice recognition is experimental. Check the interpreted move before play continues.
-							</p>
-						</div>
 
 						<button
 							type="button"
@@ -1411,19 +1495,139 @@
 							disabled={accessChecking || turnstileVerifying}
 							onclick={startGame}>Start game</button
 						>
+
+						<div class="border-t border-[var(--border-faint)] pt-4">
+							<p class="text-[12px] font-medium text-[var(--text-muted)]">Voice access</p>
+							{#if !accessReady}
+								<p class="mt-1 text-[11px] leading-5 text-[var(--text-faint)]">{accessMessage}</p>
+								<div class="mt-3 min-h-[65px]" bind:this={turnstileContainer}></div>
+							{/if}
+							<p class="mt-2 text-[10px] leading-4 text-[var(--text-faint)]">
+								Audio is sent to OpenAI when you release the button for speech to text.
+							</p>
+						</div>
+
 					</section>
-					{:else}
+
+						<section
+							class="rounded border border-[var(--border)] bg-[var(--surface)] p-4 shadow-xl"
+							aria-labelledby="move-interpreter-title"
+						>
+							<div class="border-b border-[var(--border-faint)] pb-5">
+								<div class="flex items-center justify-between gap-3">
+									<p class="font-mono text-[9px] tracking-[0.14em] text-[var(--accent)]">THE MOVE INTERPRETER</p>
+									<div class="group relative shrink-0">
+										<button
+											type="button"
+											class="flex items-center gap-1 rounded-[3px] px-1.5 py-1 text-[10px] text-[var(--text-faint)] transition-colors hover:bg-[var(--surface-hover)] hover:text-[var(--text)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-hover)]"
+											aria-describedby="move-interpreter-system-prompt"
+										>
+											System prompt <span aria-hidden="true">?</span>
+										</button>
+										<div
+											id="move-interpreter-system-prompt"
+											role="tooltip"
+											class="invisible absolute top-full right-0 z-30 mt-2 w-[min(290px,calc(100vw-3rem))] rounded-[4px] border border-[var(--border-strong)] bg-[var(--surface-raised)] p-3 opacity-0 shadow-xl transition-opacity group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100"
+										>
+											<p class="mb-2 text-[11px] font-medium text-[var(--text)]">System prompt</p>
+											<pre class="whitespace-pre-wrap break-words font-mono text-[9px] leading-4 text-[var(--text-muted)]">{moveInterpreterSystemPrompt}</pre>
+										</div>
+									</div>
+								</div>
+								<h2 id="move-interpreter-title" class="mt-2 font-display text-[26px] leading-[1.08] text-[var(--text)]">
+									I trained a 4B model to understand spoken chess.
+								</h2>
+								<p class="mt-3 text-[13px] leading-6 text-[var(--text-muted)]">
+									It gets one finalized transcript and turns it into a compact move description.
+								</p>
+								<div class="mt-4 rounded-[4px] border border-[var(--border-faint)] bg-[var(--surface-low)] p-3.5">
+									<p class="font-display text-[13px] tracking-[0.02em] text-[var(--text-faint)]">
+										Where frontier models fail
+									</p>
+									<p class="mt-2 text-[13px] leading-5 text-[var(--text)]">
+										<span class="text-[var(--text-faint)]">Input</span> “yes, can we take the piece on g eight next”
+									</p>
+									<div class="mt-3 space-y-2 font-mono text-[10px]">
+										<div class="flex items-start justify-between gap-3 text-[var(--accent)]">
+											<span>Trained Qwen3 4B</span>
+											<span class="text-right">M|-|g8|-|-|-|x|-|- ✓</span>
+										</div>
+										<div class="flex items-start justify-between gap-3 text-[var(--text-muted)]">
+											<span>Claude Haiku 4.5</span>
+											<span>UNKNOWN</span>
+										</div>
+										<div class="flex items-start justify-between gap-3 text-[var(--text-muted)]">
+											<span>GPT-4o mini</span>
+											<span>UNKNOWN</span>
+										</div>
+									</div>
+									<p class="mt-2.5 text-[10px] text-[var(--text-faint)]">Correct meaning: capture on g8.</p>
+								</div>
+								<div class="mt-4 flex flex-col items-start gap-2 text-xs">
+									<a
+										href="https://huggingface.co/spaces/rrodolfo0/move-intent-frontier-model-comparison"
+										class="rounded bg-[var(--accent)] px-3 py-2 font-semibold text-[var(--accent-text)] transition-colors hover:bg-[var(--accent-hover)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-hover)]"
+										>Try base vs. trained</a
+									>
+									<a
+										href="https://huggingface.co/rrodolfo0/qwen3-4b-move-intent-curve-2700/tree/e3e3648fa782da1b8ecf0915720e7949fdc93fa8"
+										class="px-1 py-1 text-[var(--accent)] underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-hover)]"
+										>Model on Hugging Face ↗</a
+									>
+								</div>
+							</div>
+							<p
+								id="official-model-results"
+								class="mt-5 mb-5 font-mono text-[9px] tracking-[0.12em] text-[var(--text-faint)]"
+							>
+								Eval tests comparison
+							</p>
+							<div class="space-y-3" aria-label="Official move interpretation results on the shared 30-case panel">
+								<div>
+									<div class="mb-1.5 flex items-end justify-between gap-4 text-xs">
+										<span class="text-[var(--text)]">Trained Qwen3 4B</span>
+										<span class="shrink-0 whitespace-nowrap font-mono text-[var(--accent)]">29 / 30 · 96.7%</span>
+									</div>
+									<div class="h-2 overflow-hidden rounded-full bg-[var(--border)]">
+										<div class="h-full w-[96.7%] rounded-full bg-[var(--accent)]"></div>
+									</div>
+								</div>
+								<div>
+									<div class="mb-1.5 flex items-end justify-between gap-4 text-xs">
+										<span class="text-[var(--text-subtle)]">Claude Haiku 4.5 · best prompt</span>
+										<span class="shrink-0 whitespace-nowrap font-mono text-[var(--text-muted)]">24 / 30 · 80.0%</span>
+									</div>
+									<div class="h-2 overflow-hidden rounded-full bg-[var(--border)]">
+										<div class="h-full w-4/5 rounded-full bg-[var(--text-muted)]"></div>
+									</div>
+								</div>
+								<div>
+									<div class="mb-1.5 flex items-end justify-between gap-4 text-xs">
+										<span class="text-[var(--text-subtle)]">GPT-4o mini · best prompt</span>
+										<span class="shrink-0 whitespace-nowrap font-mono text-[var(--text-muted)]">17 / 30 · 56.7%</span>
+									</div>
+									<div class="h-2 overflow-hidden rounded-full bg-[var(--border)]">
+										<div class="h-full w-[56.7%] rounded-full bg-[var(--text-muted)]"></div>
+									</div>
+								</div>
+							</div>
+						</section>
+						{:else}
 					<section class="flex flex-col gap-4 border-y border-[var(--border-medium)] py-5">
 						<div class="flex items-start justify-between gap-4">
 							<div>
-								<h2 class="text-[15px] font-medium text-[var(--text)]">Voice input</h2>
+								<h2 class="text-[15px] font-medium text-[var(--text)]">Voice</h2>
 								<p class="mt-0.5 text-[12px] text-[var(--text-subtle)]">
-									{listening
+									{speechCorrection
+										? 'Microphone paused during correction'
+										: listening
 										? 'Listening now'
 										: requestingMicrophone
 											? 'Opening the microphone'
 										: processingVoice
-											? 'Checking the move'
+											? 'Transcribing'
+											: announcementPending
+												? 'Speaking'
 											: accessReady
 												? 'Ready for a complete move'
 												: 'Voice unavailable — typed play still works'}
@@ -1436,14 +1640,26 @@
 							>
 						</div>
 
+						<label class="flex cursor-pointer items-start gap-2 rounded-[3px] border border-[var(--border-faint)] px-3 py-2 text-[11px] leading-4 text-[var(--text-faint)]">
+							<input
+								type="checkbox"
+								class="mt-0.5 size-3.5 accent-[var(--accent)]"
+								bind:checked={retainShadowEvidence}
+								disabled={listening || requestingMicrophone || processingVoice || !accessReady}
+							/>
+							<span>
+								Keep this next voice turn for optional SLM shadow review. This stores its finalized transcript, both host outcomes, and release identities for up to 30 days. It does not grant training consent.
+							</span>
+						</label>
+
 						<button
 							type="button"
 							class="shadow-primary flex min-h-[96px] touch-none select-none items-center gap-4 rounded-[4px] bg-[var(--accent)] px-5 py-4 text-left text-[var(--accent-text)] transition-[background-color,transform,opacity] duration-150 hover:bg-[var(--accent-hover)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-55 motion-reduce:animate-none"
 							class:animate-[pulse-ring_1.4s_ease-out_infinite]={listening}
 							class:animate-voice-press={listening}
 							class:animate-voice-release={releaseAnimation}
-							aria-keyshortcuts="Space"
-							disabled={requestingMicrophone || processingVoice || !gameCanAcceptInput || !accessReady}
+							aria-keyshortcuts={speechCorrection ? undefined : 'Space'}
+							disabled={speechCorrection !== undefined || requestingMicrophone || processingVoice || !gameCanAcceptInput || !accessReady}
 							onpointerdown={() => beginListening('pointer')}
 							onpointerup={() => stopListening('pointer')}
 							onpointerleave={() => stopListening('pointer')}
@@ -1462,34 +1678,66 @@
 							</span>
 							<span class="flex flex-col">
 								<span class="text-[17px] font-semibold">
-									{listening
-										? 'Listening…'
+								{speechCorrection
+									? 'Microphone paused'
+									: listening
+									? 'Listening…'
 										: requestingMicrophone
 											? 'Opening microphone…'
 											: processingVoice
-												? 'Processing move…'
+												? 'Transcribing…'
 												: 'Hold to speak'}
 								</span>
 								<span class="mt-0.5 text-[12px] opacity-70">
-									{listening ? 'Release to send' : 'You can also hold Space'}
+								{speechCorrection
+									? `Correction window · ${speechCorrection.secondsRemaining}s`
+									: listening
+										? 'Release to send'
+										: 'You can also hold Space'}
 								</span>
 							</span>
 						</button>
 
-						<div class="min-h-[68px]" aria-live="polite">
-							<p
-								class="text-[15px] leading-[1.5] text-pretty"
-								class:text-[var(--text)]={transcript !== ''}
-								class:text-[var(--text-faint)]={transcript === ''}
-							>
-								{positionDetailsVisible
-									? transcript || 'Your transcript and move result will appear here.'
-									: 'Position details are hidden for the blindfolded player.'}
-							</p>
-							{#if parseHint && positionDetailsVisible}
-								<p class="mt-1.5 text-[12px] leading-[1.45] text-[var(--accent)]">
-									{parseHint}
+						<div class="min-h-[68px] space-y-2.5" aria-live="polite">
+							{#if requestingMicrophone}
+								<p class="text-[14px] text-[var(--text-muted)]">Opening microphone…</p>
+							{:else if listening}
+								<div class="flex items-center gap-2 text-[14px] text-[var(--text)]">
+									<span class="size-2 animate-pulse rounded-full bg-[var(--accent)] motion-reduce:animate-none" aria-hidden="true"></span>
+									<span>Listening… Release when you are done.</span>
+								</div>
+							{:else if processingVoice}
+								<p class="text-[14px] text-[var(--text-muted)]">Transcribing…</p>
+							{/if}
+
+							{#if heardTranscript}
+								<div class="rounded-[3px] border border-[var(--border-faint)] bg-[var(--surface)] px-3 py-2.5">
+									<p class="text-[10px] font-semibold uppercase tracking-[0.12em] text-[var(--text-faint)]">You said</p>
+									<p class="mt-1 text-[15px] leading-[1.45] text-[var(--text)]">“{heardTranscript}”</p>
+								</div>
+							{/if}
+
+							{#if spokenCaption}
+								<div class="flex items-start gap-2.5 rounded-[3px] bg-[var(--surface-active)] px-3 py-2.5 text-[var(--accent)]">
+									<svg viewBox="0 0 24 24" class="mt-0.5 size-4 shrink-0" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+										<path d="M11 5 6.5 9H3v6h3.5L11 19V5Z"></path>
+										<path d="M15 9.5a4 4 0 0 1 0 5M17.5 7a7.5 7.5 0 0 1 0 10"></path>
+									</svg>
+									<p class="text-[14px] leading-[1.45] text-[var(--text)]">{spokenCaption}</p>
+								</div>
+							{/if}
+
+							{#if transcript && positionDetailsVisible}
+								<p class="text-[14px] leading-[1.45] text-[var(--text-muted)]">{transcript}</p>
+							{:else if !requestingMicrophone && !listening && !processingVoice && !heardTranscript && !spokenCaption}
+								<p class="text-[14px] leading-[1.45] text-[var(--text-faint)]">
+									{positionDetailsVisible
+										? 'Your transcript and move result will appear here.'
+										: 'Position details are hidden for the blindfolded player.'}
 								</p>
+							{/if}
+							{#if parseHint && positionDetailsVisible}
+								<p class="text-[12px] leading-[1.45] text-[var(--accent)]">{parseHint}</p>
 							{/if}
 						</div>
 
@@ -1512,10 +1760,10 @@
 									>Play</button
 								>
 							</div>
-						</form>
-					</section>
+							</form>
+						</section>
 
-					{#if lastMoveSan && positionDetailsVisible}
+						{#if lastMoveSan && positionDetailsVisible && !speechCorrection}
 						<section
 							class="flex items-center justify-between gap-3 border-b border-[var(--border-faint)] px-1 pb-3.5"
 							aria-live="polite"
@@ -1524,34 +1772,13 @@
 								<p class="text-[13px] text-[var(--text-muted)]">
 									Last move <span class="font-mono text-[var(--text)]">{lastMoveSan}</span>
 								</p>
-								{#if speechCorrection}
-									<p class="mt-0.5 font-mono text-[10px] text-[var(--accent)]">
-										CORRECT FOR {speechCorrection.secondsRemaining}s
-									</p>
-								{/if}
 							</div>
 							<div class="flex shrink-0 gap-2">
-								{#if speechCorrection}
-									<button
-										type="button"
-										class="rounded border border-[var(--border-strong)] bg-transparent px-3 py-1.5 text-[12px] text-[var(--text-muted)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-hover)]"
-										onclick={() => keepSpeechMove()}>Keep</button
-									>
-								{/if}
 								<button
 									type="button"
 									class="rounded border border-[var(--border-strong)] bg-transparent px-3 py-1.5 text-[12px] text-[var(--accent-soft)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-text)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-hover)]"
 									onclick={undoLastMove}>Undo</button
 								>
-							</div>
-						</section>
-					{/if}
-					{#if speechCorrection && !positionDetailsVisible}
-						<section class="flex items-center justify-between gap-3 border-b border-[var(--border-faint)] px-1 pb-3.5">
-							<p class="text-[12px] text-[var(--text-muted)]">Correction window · {speechCorrection.secondsRemaining}s</p>
-							<div class="flex gap-2">
-								<button type="button" class="rounded border border-[var(--border-strong)] px-3 py-1.5 text-[12px]" onclick={() => keepSpeechMove()}>Keep</button>
-								<button type="button" class="rounded border border-[var(--border-strong)] px-3 py-1.5 text-[12px] text-[var(--accent-soft)]" onclick={undoLastMove}>Undo</button>
 							</div>
 						</section>
 					{/if}
@@ -1586,7 +1813,7 @@
 				<div>
 					<div class="flex items-center gap-2.5">
 						<img src="/brand/logo-options/01-ribbon-wrap.svg" alt="" class="size-8 rounded-[10px] shadow-sm" />
-						<p class="font-display text-[22px] text-[var(--text)]">Voice to Chess</p>
+						<p class="font-display text-[22px] text-[var(--text)]">Blindfold Chess</p>
 					</div>
 					<p class="mt-2 max-w-[18rem] text-[13px] leading-6 text-[var(--text-subtle)]">
 						A local chess board for sighted and blindfolded play.

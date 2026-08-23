@@ -1,4 +1,5 @@
 type AnnounceableMove = {
+	color: 'white' | 'black';
 	san: string;
 };
 
@@ -20,16 +21,17 @@ const promotionNames: Readonly<Record<string, string>> = {
 /** Converts canonical SAN into a short phrase suitable for move announcements. */
 export function moveAnnouncement(move: AnnounceableMove): string {
 	const san = move.san.trim();
+	const prefix = `${move.color === 'white' ? 'White' : 'Black'} played: `;
 	const suffix = san.endsWith('#') ? ' Checkmate.' : san.endsWith('+') ? ' Check.' : '';
 	const notation = san.replace(/[+#]+$/, '');
 
-	if (notation === 'O-O') return `Castle kingside.${suffix}`;
-	if (notation === 'O-O-O') return `Castle queenside.${suffix}`;
+	if (notation === 'O-O') return `${prefix}Castle kingside.${suffix}`;
+	if (notation === 'O-O-O') return `${prefix}Castle queenside.${suffix}`;
 
 	const pieceMove = notation.match(/^([KQRBN])([a-h]?[1-8]?)(x?)([a-h][1-8])(?:=([QRBN]))?$/);
 	if (pieceMove) {
 		const [, piece, source, capture, destination, promotion] = pieceMove;
-		return finishAnnouncement(
+		return prefix + finishAnnouncement(
 			`${pieceNames[piece]}${sourcePhrase(source)} ${capture ? 'takes' : 'to'} ${destination}`,
 			promotion,
 			suffix
@@ -40,12 +42,12 @@ export function moveAnnouncement(move: AnnounceableMove): string {
 	if (pawnMove) {
 		const [, sourceFile, capture, destination, promotion] = pawnMove;
 		const action = capture ? `Pawn from ${sourceFile} takes ${destination}` : `Pawn to ${destination}`;
-		return finishAnnouncement(action, promotion, suffix);
+		return prefix + finishAnnouncement(action, promotion, suffix);
 	}
 
 	// Canonical SAN should always match one of the forms above. Keeping a safe
 	// fallback means a future chess.js notation addition still gets announced.
-	return `Move ${san}.`;
+	return `${prefix}Move ${san}.`;
 }
 
 function sourcePhrase(source: string): string {

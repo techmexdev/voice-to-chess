@@ -11,9 +11,11 @@
 	type Props = {
 		view: BoardSeatView;
 		onMove: (request: BoardMoveRequest) => void;
+		positionHidden?: boolean;
 	};
 
-	let { view, onMove }: Props = $props();
+	const emptyPosition = '8/8/8/8/8/8/8/8';
+	let { view, onMove, positionHidden = false }: Props = $props();
 	let boardRoot: HTMLElement;
 	let chessground: Api | undefined;
 
@@ -26,18 +28,18 @@
 		);
 	}
 
-	function configFor(currentView: BoardSeatView): Config {
+	function configFor(currentView: BoardSeatView, hidden: boolean): Config {
 		return {
-			fen: currentView.fen,
+			fen: hidden ? emptyPosition : currentView.fen,
 			orientation: currentView.orientation,
-			turnColor: currentView.turn,
-			check: currentView.check,
-			lastMove: currentView.lastMove ? [...currentView.lastMove] : undefined,
+			turnColor: hidden ? undefined : currentView.turn,
+			check: hidden ? undefined : currentView.check,
+			lastMove: hidden ? undefined : currentView.lastMove ? [...currentView.lastMove] : undefined,
 			autoCastle: true,
 			// The local browser harness dispatches synthetic pointer events. Production
 			// keeps Chessground's default trusted-event check.
 			trustAllEvents: import.meta.env.DEV,
-			coordinates: true,
+			coordinates: !hidden,
 			highlight: {
 				lastMove: true,
 				check: true
@@ -50,10 +52,10 @@
 			// mountable, then lock it with movable/selectable state when input is off.
 			viewOnly: false,
 			movable: {
-				color: currentView.inputEnabled ? currentView.turn : undefined,
+				color: currentView.inputEnabled && !hidden ? currentView.turn : undefined,
 				free: false,
-				dests: legalDestinationsFor(currentView),
-				showDests: currentView.inputEnabled,
+				dests: hidden ? new Map() : legalDestinationsFor(currentView),
+				showDests: currentView.inputEnabled && !hidden,
 				events: {
 					after: (from, to) => onMove({ from: from as Square, to: to as Square })
 				}
@@ -68,7 +70,7 @@
 				enabled: false
 			},
 			selectable: {
-				enabled: currentView.inputEnabled
+				enabled: currentView.inputEnabled && !hidden
 			},
 			drawable: {
 				enabled: false
@@ -93,7 +95,7 @@
 
 		void import('@lichess-org/chessground').then(({ Chessground }) => {
 			if (destroyed) return;
-			chessground = Chessground(boardRoot, configFor(committedView(view)));
+			chessground = Chessground(boardRoot, configFor(committedView(view), positionHidden));
 		});
 
 		return () => {
@@ -113,7 +115,7 @@
 			inputEnabled: view.inputEnabled
 		} satisfies BoardSeatView;
 
-		chessground?.set(configFor(nextView));
+		chessground?.set(configFor(nextView, positionHidden));
 	});
 </script>
 
@@ -121,8 +123,8 @@
 	bind:this={boardRoot}
 	class="chessground-board"
 	role="application"
-	aria-label="Board Seat chessboard"
-	aria-busy={!view.inputEnabled}
+	aria-label={positionHidden ? 'Hidden chessboard' : 'Board Seat chessboard'}
+	aria-busy={!view.inputEnabled || positionHidden}
 ></div>
 
 <style>

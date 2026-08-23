@@ -1,5 +1,5 @@
 {
-	"name": "@voice-to-chess/web",
+	"name": "@blindfold-chess/web",
 	"private": true,
 	"version": "0.0.1",
 	"license": "GPL-3.0-or-later",
@@ -8,7 +8,7 @@
 		"dev": "vite dev",
 		"build": "vite build",
 		"preview": "vite preview",
-		"test": "node --test src/lib/game/*.test.ts src/lib/server/openai/*.test.ts",
+		"test": "node --test src/lib/game/*.test.ts src/lib/server/*.test.ts src/lib/server/openai/*.test.ts src/lib/server/security/*.test.ts",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch"
